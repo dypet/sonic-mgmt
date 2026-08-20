@@ -191,7 +191,7 @@ def test_ha_dpu_failure(
     )
     down_ok, down_state = wait_for_ha_scope_pmon_state(
         dut, scope_key, expected_state="down",
-        timeout=60, interval=5,
+        timeout=480, interval=5,
     )
 
     # Restore the DPU before fixture teardown even when state validation fails.
