@@ -1,5 +1,6 @@
 import logging
 import random
+import time
 from ipaddress import ip_address
 
 import ptf.packet as scapy
@@ -327,12 +328,21 @@ def get_scapy_l4_protocol_key(inner_packet_type):
     return l4_protocol_key
 
 
-def bootstrap_pl_tcp_flow_outbound(ptfadapter, config, outer_encap="vxlan", recv_ports=None, **kwargs):
+def bootstrap_pl_tcp_flow_outbound(
+    ptfadapter, config, outer_encap="vxlan", recv_ports=None,
+    attempts=6, verify_timeout=2, retry_interval=1, **kwargs
+):
     """
-    Bootstrap a stateful TCP flow on the DPU by sending a single SYN through the outbound
-    path and verifying it is forwarded. After this call, subsequent ACK-flagged packets
-    matching the same 5-tuple (in either direction) match the established flow and are
-    forwarded.
+    Bootstrap a stateful TCP flow on the DPU by sending a SYN through the outbound path
+    and verifying it is forwarded. The probe is retried up to ``attempts`` times (each
+    verify waiting ``verify_timeout`` seconds, sleeping ``retry_interval`` between
+    attempts): the first probe often fires right after an HA (re)activation / reload /
+    power event, before the DASH pipeline is forwarding, so a lone SYN can be silently
+    dropped. On each retry a bare ACK is also sent as a fallback -- it is forwarded only
+    if the flow already exists, covering the case where the first SYN created the flow
+    but its egress was missed (a repeated SYN would otherwise be dropped as a duplicate
+    by SYN-flood protection). After this call, subsequent ACK-flagged packets matching
+    the same 5-tuple (in either direction) match the established flow and are forwarded.
 
     ``recv_ports`` is the list of PTF port indices on which the SYN's expected egress is
     accepted. Defaults to ``config[REMOTE_PTF_RECV_INTF]``. In HA setups the standby DPU
@@ -361,6 +371,40 @@ def bootstrap_pl_tcp_flow_outbound(ptfadapter, config, outer_encap="vxlan", recv
     syn_pkt, exp_syn_pkt = outbound_pl_packets(
         config, outer_encap, tcp_flag_syn=True, **kwargs
     )
-    ptfadapter.dataplane.flush()
-    testutils.send(ptfadapter, config[LOCAL_PTF_INTF], syn_pkt, 1)
-    testutils.verify_packet_any_port(ptfadapter, exp_syn_pkt, recv_ports)
+    # A bare ACK is forwarded only if the flow already exists; it is used to confirm the
+    # flow on retries, where a repeat SYN would be dropped as a duplicate (SYN-flood
+    # protection) even though the first SYN already created the flow.
+    ack_pkt, exp_ack_pkt = outbound_pl_packets(
+        config, outer_encap, tcp_flag_ack=True, **kwargs
+    )
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        ptfadapter.dataplane.flush()
+        testutils.send(ptfadapter, config[LOCAL_PTF_INTF], syn_pkt, 1)
+        try:
+            testutils.verify_packet_any_port(
+                ptfadapter, exp_syn_pkt, recv_ports, timeout=verify_timeout
+            )
+            return
+        except Exception as err:
+            last_err = err
+        # SYN not observed: either the pipeline is not forwarding yet, or the flow was
+        # created but its egress was missed. An ACK confirms the latter without tripping
+        # duplicate-SYN drops.
+        testutils.send(ptfadapter, config[LOCAL_PTF_INTF], ack_pkt, 1)
+        try:
+            testutils.verify_packet_any_port(
+                ptfadapter, exp_ack_pkt, recv_ports, timeout=verify_timeout
+            )
+            return
+        except Exception:
+            logger.info(
+                "bootstrap_pl_tcp_flow_outbound: flow not established yet "
+                "(attempt %d/%d), retrying",
+                attempt,
+                attempts,
+            )
+            time.sleep(retry_interval)
+
+    raise last_err

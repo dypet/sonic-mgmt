@@ -13,7 +13,7 @@ from constants import (
     VXLAN_UDP_BASE_SRC_PORT,
     VXLAN_UDP_SRC_PORT_MASK,
 )
-from ha_packets import outbound_pl_packets
+from ha_packets import outbound_pl_packets, bootstrap_pl_tcp_flow_outbound
 from tests.common.devices.duthosts import DutHosts
 from tests.common.dash_utils import apply_swssconfig_file
 from tests.common.helpers.assertions import pytest_assert, pytest_require
@@ -210,16 +210,10 @@ def _send_continuous_pl_traffic(ptfadapter, send_config, recv_ports, stop_event,
 
 
 def _verify_baseline_pl_traffic(ptfadapter, send_config, recv_ports):
-    # Send SYN so the DPU creates the stateful TCP flow; subsequent ACK traffic in the
-    # continuous-traffic thread then matches the established flow.
-    send_pkt, exp_pkt = outbound_pl_packets(send_config, "vxlan", tcp_flag_syn=True)
-    ptfadapter.dataplane.flush()
-    testutils.send(ptfadapter, send_config[LOCAL_PTF_INTF], send_pkt, count=1)
-    testutils.verify_packet_any_port(
-        ptfadapter,
-        exp_pkt,
-        recv_ports,
-        timeout=PL_VERIFY_TIMEOUT,
+    # Establish the stateful TCP flow (retried) so subsequent ACK traffic in the
+    # continuous-traffic thread matches the established flow.
+    bootstrap_pl_tcp_flow_outbound(
+        ptfadapter, send_config, "vxlan", recv_ports=recv_ports
     )
 
 
